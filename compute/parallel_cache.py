@@ -1,5 +1,6 @@
 import os.path as op
 import time
+import shutil
 from itertools import repeat
 
 import numpy as np
@@ -26,6 +27,7 @@ class ParallelCache(object):
         self._retries = retries
         self._poll_interval = poll_interval
         self._verbose = verbose
+        self._execution_times = None
         if cluster_profile is not None:
             self._ip_client = Client(profile=cluster_profile, **kwargs)
         else:
@@ -73,6 +75,7 @@ class ParallelCache(object):
                 tasks.append(lbview.apply(f, *this_args, **kwargs))
             # wait for tasks to complete
             result_retrieved = [False] * len(tasks)
+            execution_times = [None] * len(tasks)
             retry_no = np.zeros(len(tasks), dtype=np.int)
             last_print = 0
             last_idle_check = time.time()
@@ -82,6 +85,7 @@ class ParallelCache(object):
                     if not result_retrieved[ii] and task.ready():
                         if task.successful():
                             out[ii] = task.get()
+                            execution_times[ii] = task.serial_time
                             result_retrieved[ii] = True
                         else:
                             # task failed for some reason, re-run it
@@ -120,6 +124,8 @@ class ParallelCache(object):
                     queue = self._ip_client.queue_status()
                     shutdown_eids = []
                     for eid in self._ip_client.ids:
+                        if eid not in queue:
+                            continue
                         if queue[eid]['queue'] + queue[eid]['tasks'] == 0:
                             # engine is idle
                             idle_time = idle_times.get(eid, None)
@@ -144,6 +150,7 @@ class ParallelCache(object):
                     last_idle_check = now
                 time.sleep(self._poll_interval)
 
+            self._execution_times = execution_times
             if self._shutdown:
                 self._shutdown_cluster()
 
@@ -154,6 +161,7 @@ class ParallelCache(object):
             f_cache = self._memory.cache(f)
             lbview = None
             out = [None] * n_jobs
+            execution_times = [None] * n_jobs
             task_info = list()
 
             n_cache = 0
@@ -191,6 +199,7 @@ class ParallelCache(object):
                             f_cache._persist_input(out_dir, *ti['args'], **kwargs)
                             # insert result into output
                             out[ti['idx']] = this_out
+                            execution_times[ti['idx']] = task.serial_time
                             result_retrieved[ii] = True
                         else:
                             if retry_no[ii] < self._retries:
@@ -218,6 +227,8 @@ class ParallelCache(object):
                     queue = self._ip_client.queue_status()
                     shutdown_eids = []
                     for eid in self._ip_client.ids:
+                        if eid not in queue:
+                            continue
                         if queue[eid]['queue'] + queue[eid]['tasks'] == 0:
                             # engine is idle
                             idle_time = idle_times.get(eid, None)
@@ -231,6 +242,16 @@ class ParallelCache(object):
                         elif eid in idle_times:
                             # engine has started running again
                             del idle_times[eid]
+
+                    if len(shutdown_eids) > 0:
+                        if self._verbose > 0:
+                            print 'Shuting-down engines: ', shutdown_eids
+                        dv = self._ip_client.direct_view(shutdown_eids)
+                        dv.shutdown()
+                        for eid in shutdown_eids:
+                            del idle_times[eid]
+
+                        last_idle_check = now
 
                 n_completed = int(np.sum(result_retrieved))
                 progress = n_completed / float(n_jobs - n_cache)
@@ -257,6 +278,8 @@ class ParallelCache(object):
                         msg += str(e)
                 raise RuntimeError('%d tasks failed:\n %s'
                                    % (len(failed_tasks), msg))
+
+            self._execution_times = execution_times
         else:
             raise RuntimeError('WTF?')
 
@@ -265,11 +288,45 @@ class ParallelCache(object):
 
         return out
 
+    def get_last_excecution_times(self):
+        return self._execution_times
+
+    def purge_results(self, f, *sequences, **kwargs):
+        # make sure all sequences have the same length
+        n_jobs = None
+        my_seqs = []
+        for ii, seq in enumerate(sequences):
+            try:
+                this_n_elems = len(seq)
+                if n_jobs is None:
+                    n_jobs = this_n_elems
+                if this_n_elems != n_jobs:
+                    raise ValueError('All sequences must have the same lenght,'
+                                     'sequence at position %d has length %d'
+                                     % (ii + 1, this_n_elems))
+                my_seqs.append(seq)
+            except TypeError:
+                # we allow passing ints etc, convert them to a sequence
+                my_seqs.append(repeat(seq))
+
+        f_cache = self._memory.cache(f)
+        n_deleted = 0
+        for this_args in zip(*my_seqs):
+            out_dir, _ = f_cache.get_output_dir(*this_args, **kwargs)
+            if op.exists(out_dir):
+                shutil.rmtree(out_dir)
+                n_deleted += 1
+        print 'Purging cache: %d out of %d deleted' % (n_deleted, n_jobs)
+
     def _shutdown_cluster(self):
         # shut down all idle engines
         queue = self._ip_client.queue_status()
-        shutdown_eids = [eid for eid in self._ip_client.ids
-                         if queue[eid]['queue'] + queue[eid]['tasks'] == 0]
+        shutdown_eids = []
+        for eid in self._ip_client.ids:
+            if eid not in queue:
+                continue
+            if queue[eid]['queue'] + queue[eid]['tasks'] == 0:
+                shutdown_eids.append(eid)
         if len(shutdown_eids) > 0:
             if self._verbose > 0:
                 print 'Shuting-down engines: ', shutdown_eids
