@@ -34,7 +34,7 @@ class ParallelCache(object):
             self._ip_client = None
 
         if cachedir is not None:
-            self._memory = Memory(cachedir=cachedir, verbose=0)
+            self._memory = Memory(cachedir=cachedir, verbose=verbose)
         else:
             self._memory = None
 
